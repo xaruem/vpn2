@@ -1,0 +1,30 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DB_PATH: /data/vpn.db            # база лежит в volume, переживает пересборку
+    volumes:
+      - ./data:/data                   # ВОЛЮМ: клиенты, сроки, оплаты (vpn.db)
+      - ./servers.json:/app/servers.json:ro
+      - ./ssh:/keys:ro                 # сюда кладётся приватный ключ ./ssh/vpnbot
+    expose:
+      - "8080"                         # наружу не публикуется, к нему ходит caddy
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data               # сертификаты, чтобы не выпускать заново
+      - caddy_config:/config
+    depends_on:
+      - bot
+
+volumes:
+  caddy_data:
+  caddy_config:

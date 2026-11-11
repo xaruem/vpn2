@@ -1,0 +1,101 @@
+[
+  {
+    "name": "🇷🇺 Сервер 1",
+    "link": "vless://{uuid}@2.26.129.81:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=stream.selectus.ru&fp=qq&pbk=ub1PHBkdqrCahRc4rgavIBm9EvIDWrZi0ff_OvEv8FU&sid=b0f839d2a5c7e146&spx=%2F&type=tcp&headerType=none",
+    "ssh_host": "2.26.129.81",
+    "ssh_port": 22,
+    "ssh_user": "root",
+    "ssh_key": "/keys/vpnbot",
+    "config_path": "/usr/local/etc/xray/config.json",
+    "inbound_tag": "",
+    "flow": "xtls-rprx-vision"
+  },
+  {
+    "name": "🇷🇺 Сервер 2",
+    "link": "vless://{uuid}@2.26.130.159:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=hatch.senko.ru&fp=qq&pbk=GUdrwZxYWVvIFgC2fSJDs6U5Un6c7t1Yuvzl7yI1ohU&sid=2f6a8c3e90b2d574&spx=%2F&type=tcp&headerType=none",
+    "ssh_host": "2.26.130.159",
+    "ssh_port": 22,
+    "ssh_user": "root",
+    "ssh_key": "/keys/vpnbot",
+    "config_path": "/usr/local/etc/xray/config.json",
+    "inbound_tag": "",
+    "flow": "xtls-rprx-vision"
+  },
+  {
+    "name": "🇷🇺 Сервер 3",
+    "link": "vless://{uuid}@2.26.135.239:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=promo-digital.wb.ru&fp=qq&pbk=lxTQST37knG1eCPA0UscdPHzTmSnMgito5r4o0vZils&sid=4e9b7a1c5f3d2e68&spx=%2F&type=tcp&headerType=none",
+    "ssh_host": "2.26.135.239",
+    "ssh_port": 22,
+    "ssh_user": "root",
+    "ssh_key": "/keys/vpnbot",
+    "config_path": "/usr/local/etc/xray/config.json",
+    "inbound_tag": "",
+    "flow": "xtls-rprx-vision"
+  },
+  {
+    "name": "🇷🇺 Сервер 4",
+    "link": "vless://{uuid}@2.26.139.204:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=cdn.tbank.ru&fp=qq&pbk=HmnsKa6Mmm34gALomXBKB7d8UMIM33hhItp2z43VCkQ&sid=a1d8f3b6c2e59407&spx=%2F&type=tcp&headerType=none",
+    "ssh_host": "2.26.139.204",
+    "ssh_port": 22,
+    "ssh_user": "root",
+    "ssh_key": "/keys/vpnbot",
+    "config_path": "/usr/local/etc/xray/config.json",
+    "inbound_tag": "",
+    "flow": "xtls-rprx-vision"
+  },
+  {
+    "name": "🇷🇺 Сервер 5",
+    "link": "vless://{uuid}@152.232.57.100:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=salam.ru&fp=qq&pbk=SqArIWpSt5VG9HVrtcZQn1r0Tc_eRvYzca2OFDBkF24&sid=1fdea407109a1750&spx=%2F&type=tcp&headerType=none",
+    "ssh_host": "152.232.57.100",
+    "ssh_port": 22,
+    "ssh_user": "root",
+    "ssh_key": "/keys/vpnbot",
+    "config_path": "/usr/local/etc/xray/config.json",
+    "inbound_tag": "",
+    "flow": "xtls-rprx-vision"
+  },
+  {
+    "name": "🇷🇺 Сервер 6",
+    "link": "vless://{uuid}@2.26.128.99:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=conf.emaar.ru&fp=qq&pbk=n6uqg76Ky-Vl-HUDF_iwZTaK3L_iQ_YoFP92U8PPYS0&sid=6d2a8e5f1b9c3704&spx=%2F&type=tcp&headerType=none",
+    "ssh_host": "2.26.128.99",
+    "ssh_port": 22,
+    "ssh_user": "root",
+    "ssh_key": "/keys/vpnbot",
+    "config_path": "/usr/local/etc/xray/config.json",
+    "inbound_tag": "",
+    "flow": "xtls-rprx-vision"
+  },
+  {
+    "name": "🇷🇺 Сервер 7",
+    "link": "vless://{uuid}@185.16.213.5:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=internity.ru&fp=qq&pbk=R_km5hxsfjRUsnZfSOBYxB9DwShSIwYacXduHR8_9gE&sid=dfcc5c5ac8507f95&spx=%2F&type=tcp&headerType=none",
+    "ssh_host": "185.16.213.5",
+    "ssh_port": 22,
+    "ssh_user": "root",
+    "ssh_key": "/keys/vpnbot",
+    "config_path": "/usr/local/etc/xray/config.json",
+    "inbound_tag": "",
+    "flow": "xtls-rprx-vision"
+  },
+  {
+    "name": "🇷🇺 Сервер 8",
+    "link": "vless://{uuid}@178.248.232.105:56443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=rutube.ru&fp=qq&pbk=UoWXZIbLDIDA1opu4ekUYLNWgci5gLgghMJ07ApYTGo&sid=228c1a2e913d1f05&spx=%2F&type=tcp&headerType=none",
+    "ssh_host": "178.248.232.105",
+    "ssh_port": 22,
+    "ssh_user": "root",
+    "ssh_key": "/keys/vpnbot",
+    "config_path": "/usr/local/etc/xray/config.json",
+    "inbound_tag": "",
+    "flow": "xtls-rprx-vision"
+  },
+  {
+    "name": "🇷🇺 Сервер 9",
+    "link": "vless://{uuid}@91.215.43.168:443?encryption=none&security=tls&sni=test.rutube.ru&fp=edge&type=xhttp&host=test.rutube.ru&path=%2Fxhttp&mode=stream-up",
+    "ssh_host": "91.215.43.168",
+    "ssh_port": 22,
+    "ssh_user": "root",
+    "ssh_key": "/keys/vpnbot",
+    "config_path": "/usr/local/etc/xray/config.json",
+    "inbound_tag": "",
+    "flow": ""
+  }
+]

@@ -1,0 +1,8 @@
+.env
+servers.json
+vpn.db
+data/*
+!data/.gitkeep
+ssh/*
+!ssh/.gitkeep
+__pycache__/
