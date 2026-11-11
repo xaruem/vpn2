@@ -49,8 +49,20 @@ def load_servers():
         if not raw.startswith("["):
             raw = base64.b64decode(raw).decode("utf-8")
         return json.loads(raw)
-    for p in (SERVERS_FILE, "/data/servers.json"):
+    cands = [SERVERS_FILE, "/data/servers.json"]
+    found = []
+    for d in {os.getcwd(), os.path.dirname(os.path.abspath(__file__))}:
+        try:
+            for fn in os.listdir(d):  # имя файла без учёта регистра: Servers.json тоже подойдёт
+                if fn.lower() in ("servers.json", "servers.example.json"):
+                    found.append(os.path.join(d, fn))
+        except OSError:
+            pass
+    cands += sorted(found, key=lambda p: ("example" in p.lower(), p))
+    for p in cands:
         if os.path.isfile(p):
+            if "example" in os.path.basename(p).lower():
+                log.warning("Использую %s: лучше переименовать в servers.json", p)
             with open(p, encoding="utf-8") as f:
                 return json.load(f)
     raise SystemExit(
