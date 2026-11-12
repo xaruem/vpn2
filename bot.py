@@ -4,7 +4,10 @@ import html
 import json
 import logging
 import os
+import re
 import secrets
+import shlex
+import socket
 import sqlite3
 import time
 import urllib.parse
@@ -82,13 +85,33 @@ def ssh_key_path(s):
         return path
     if "env" not in _key_cache:
         data = os.getenv("SSH_KEY", "")
-        if os.getenv("SSH_KEY_B64"):
-            data = base64.b64decode(os.environ["SSH_KEY_B64"]).decode("utf-8")
-        if not data.strip():
+        b64 = os.getenv("SSH_KEY_B64", "").strip().strip("\"'")
+        if b64:
+            if b64.startswith("-----BEGIN"):  # вставили сам ключ, а не base64 от него
+                data = b64
+            else:
+                b64 = "".join(b64.split())  # убираем переносы и пробелы
+                n = len(b64)
+                b64 += "=" * (-n % 4)
+                try:
+                    data = base64.b64decode(b64).decode("utf-8")
+                except Exception:
+                    raise ValueError(
+                        f"SSH_KEY_B64 повреждена: в ней {n} символов, а ключ в base64 это "
+                        "обычно 400-700 символов, начинающихся с LS0tLS1CRUdJTi. Закодируйте файл "
+                        "приватного ключа (vpnbot, без .pub) и вставьте значение целиком."
+                    ) from None
+        data = data.replace("\\n", "\n").strip()
+        if not data:
             raise FileNotFoundError(
                 f"SSH-ключ не найден ({path or 'ssh_key не задан'}). Задайте SSH_KEY_B64 "
                 "(base64 -w0 ssh/vpnbot) или примонтируйте файл ключа."
             )
+        try:
+            asyncssh.import_private_key(data)
+        except Exception as e:  # noqa: BLE001
+            hint = " Это публичный ключ (.pub): нужен приватный файл без расширения." if data.startswith("ssh-") else ""
+            raise ValueError(f"SSH_KEY_B64 не содержит рабочего приватного ключа ({e}).{hint}") from None
         fd = os.open("/tmp/vpnbot_ssh_key", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as f:
             f.write(data.replace("\\n", "\n").strip() + "\n")
@@ -200,6 +223,14 @@ async def notify(bot, tg_id, text):
         return False
 
 
+async def safe_answer(c: CallbackQuery, *a, **kw):
+    """Ответ на нажатие кнопки; если он запоздал (долгая синхронизация) — не падаем."""
+    try:
+        await c.answer(*a, **kw)
+    except TelegramBadRequest as e:
+        log.warning("callback answer: %s", e)
+
+
 async def safe_edit(c: CallbackQuery, text, kb=None):
     try:
         await c.message.edit_text(text, reply_markup=kb)
@@ -223,53 +254,372 @@ def desired_clients(server_index, server):
     return out
 
 
-async def sync_server(i, s):
-    path = s.get("config_path", "/usr/local/etc/xray/config.json")
-    xray = s.get("xray_bin", "xray")
-    async with asyncssh.connect(
+# Где обычно лежит конфиг Xray (если по пути из servers.json файла нет)
+CONFIG_CANDIDATES = [
+    "/usr/local/etc/xray/config.json",
+    "/etc/xray/config.json",
+    "/opt/xray/config.json",
+    "/usr/local/x-ui/bin/config.json",
+    "/etc/x-ui/config.json",
+    "/usr/local/etc/v2ray/config.json",
+    "/var/lib/marzban/xray_config.json",
+]
+SSH_CONNECT_TIMEOUT = 12  # секунд на TCP-соединение
+SSH_LOGIN_TIMEOUT = 20  # секунд на вход по ключу
+SYNC_TIMEOUT = 60  # секунд на один сервер целиком
+LAST_ERRORS = {}  # имя сервера -> причина последнего сбоя (для сообщений админу)
+
+
+def strip_json_comments(text):
+    """Xray допускает // и /* */ в конфиге, обычный json их не принимает; строки не трогаем."""
+    out, i, n, in_str = [], 0, len(text), False
+    while i < n:
+        c = text[i]
+        if in_str:
+            out.append(c)
+            if c == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 1
+            elif c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+            out.append(c)
+        elif c == "/" and text[i + 1 : i + 2] == "/":
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        elif c == "/" and text[i + 1 : i + 2] == "*":
+            end = text.find("*/", i + 2)
+            i = n if end == -1 else end + 2
+            continue
+        else:
+            out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def parse_config(text):
+    try:
+        return json.loads(text)
+    except ValueError:
+        return json.loads(strip_json_comments(text))
+
+
+def link_port(s):
+    """Порт сервера из ссылки подключения (по нему выбираем нужный inbound)."""
+    m = re.search(r"@(?:\[[^\]]+\]|[^:/?#@]+):(\d+)", s.get("link", ""))
+    return m.group(1) if m else None
+
+
+def vless_inbounds(cfg):
+    return [
+        x
+        for x in cfg.get("inbounds", [])
+        if isinstance(x, dict) and str(x.get("protocol", "")).lower() == "vless"
+    ]
+
+
+def describe_inbounds(vless):
+    return "; ".join(f"порт {x.get('port')}, tag {x.get('tag')!r}" for x in vless) or "нет"
+
+
+def pick_inbound(cfg, s):
+    vless = vless_inbounds(cfg)
+    if not vless:
+        raise RuntimeError("в конфиге нет ни одного vless-inbound")
+    tag = s.get("inbound_tag")
+    if tag:
+        sel = [x for x in vless if x.get("tag") == tag]
+        if len(sel) != 1:
+            raise RuntimeError(f"inbound_tag {tag!r} не найден. Есть: {describe_inbounds(vless)}")
+        return sel[0]
+    port = link_port(s)
+    sel = [x for x in vless if port and str(x.get("port")) == port]
+    if not sel and len(vless) == 1:
+        sel = vless
+    if len(sel) != 1:
+        raise RuntimeError(
+            f"не удалось выбрать inbound (порт из ссылки: {port}). Есть: {describe_inbounds(vless)}. "
+            "Укажите inbound_tag для этого сервера в servers.json"
+        )
+    return sel[0]
+
+
+def ssh_connect(s):
+    return asyncssh.connect(
         s["ssh_host"],
         port=s.get("ssh_port", 22),
         username=s.get("ssh_user", "root"),
         client_keys=[ssh_key_path(s)],
         known_hosts=None,
-    ) as conn:
-        res = await conn.run(f"cat {path}", check=True)
-        cfg = json.loads(res.stdout)
-        inbounds = [x for x in cfg["inbounds"] if x.get("protocol") == "vless"]
-        if s.get("inbound_tag"):
-            inbounds = [x for x in inbounds if x.get("tag") == s["inbound_tag"]]
-        ib = inbounds[0]
-        old = ib["settings"]["clients"]
+        connect_timeout=SSH_CONNECT_TIMEOUT,
+        login_timeout=SSH_LOGIN_TIMEOUT,
+    )
+
+
+async def sh(conn, cmd, input=None):
+    """Команда на сервере; при ошибке исключение с кодом выхода и текстом stderr."""
+    r = await conn.run(cmd, input=input, check=False)
+    if r.exit_status != 0:
+        err = (getattr(r, "stderr", "") or r.stdout or "").strip().splitlines()
+        raise RuntimeError(f"«{cmd[:60]}» вернула код {r.exit_status}" + (f": {err[-1][:200]}" if err else ""))
+    return r.stdout or ""
+
+
+async def read_remote(conn, path):
+    r = await conn.run(f"cat {shlex.quote(path)}", check=False)
+    return (r.stdout or "") if r.exit_status == 0 else None
+
+
+async def find_config(conn, s):
+    """(путь, текст). Сначала config_path из servers.json, затем процесс xray, затем типовые места."""
+    want = (s.get("config_path") or "").strip()
+    tried = []
+    if want and want != "auto":
+        text = await read_remote(conn, want)
+        if text is not None:
+            return want, text
+        tried.append(want)
+    found = []
+    r = await conn.run("ps -eo args", check=False)
+    if r.exit_status == 0:
+        for line in (r.stdout or "").splitlines():
+            if "xray" in line.lower():
+                found += re.findall(r"(?:^|\s)(?:-c|-config|--config)(?:=|\s+)(/\S+\.json)", line)
+    for p in dict.fromkeys(found + CONFIG_CANDIDATES):
+        if p in tried:
+            continue
+        tried.append(p)
+        text = await read_remote(conn, p)
+        if text is None:
+            continue
+        try:
+            cfg = parse_config(text)
+        except ValueError:
+            continue
+        if isinstance(cfg, dict) and vless_inbounds(cfg):
+            if want and want != "auto":
+                log.warning("%s: файла %s нет, использую найденный %s (укажите его в config_path)", s["name"], want, p)
+            return p, text
+    raise RuntimeError("конфиг Xray не найден. Проверенные пути: " + ", ".join(tried))
+
+
+async def sync_server(i, s):
+    q = shlex.quote
+    xray = s.get("xray_bin", "xray")
+    restart = s.get("restart_cmd") or "systemctl restart xray"
+    # после перезапуска проверяем, что служба жива (для своей restart_cmd — только если задан check_cmd)
+    check = s["check_cmd"] if "check_cmd" in s else ("" if s.get("restart_cmd") else "systemctl is-active --quiet xray")
+    tmp = f"/tmp/vpnbot-xray-{i}.json"  # расширение .json обязательно: иначе xray не определит формат
+    async with ssh_connect(s) as conn:
+        path, text = await find_config(conn, s)
+        try:
+            cfg = parse_config(text)
+        except ValueError as e:
+            raise RuntimeError(f"{path} не читается как JSON: {e}") from None
+        ib = pick_inbound(cfg, s)
+        settings = ib.setdefault("settings", {})
+        old = settings.get("clients") or []
         # не трогаем клиентов, добавленных вручную (без email tg_...)
         keep = [c for c in old if not str(c.get("email", "")).startswith("tg_")]
         new = keep + desired_clients(i, s)
         if new == old:
-            return
-        ib["settings"]["clients"] = new
-        await conn.run(f"cat > {path}.new", input=json.dumps(cfg, indent=2), check=True)
-        await conn.run(f"{xray} run -test -config {path}.new", check=True)
-        await conn.run(f"cp {path} {path}.bak", check=True)
-        # cp, а не mv: сохраняются владелец и права исходного конфига
-        await conn.run(f"cp {path}.new {path} && rm {path}.new", check=True)
-        r = await conn.run("systemctl restart xray")
-        if r.exit_status != 0:
-            await conn.run(f"cp {path}.bak {path} && systemctl restart xray")
-            raise RuntimeError("xray не перезапустился, конфиг откатан")
+            return False
+        settings["clients"] = new
+        try:
+            await sh(conn, f"cat > {tmp}", input=json.dumps(cfg, indent=2, ensure_ascii=False))
+            await sh(conn, f"{xray} run -test -config {tmp}")
+            await sh(conn, f"cp {q(path)} {q(path)}.bak")
+            # cp, а не mv: сохраняются владелец и права исходного конфига
+            await sh(conn, f"cp {tmp} {q(path)}")
+        finally:
+            await conn.run(f"rm -f {tmp}", check=False)
+        try:
+            await sh(conn, restart)
+            if check:
+                await sh(conn, "sleep 2")
+                await sh(conn, check)
+        except Exception as e:  # noqa: BLE001
+            await conn.run(f"cp {q(path)}.bak {q(path)}", check=False)
+            r = await conn.run(restart, check=False)
+            back = "старый конфиг возвращён" if r.exit_status == 0 else "старый конфиг возвращён, но перезапуск не удался"
+            raise RuntimeError(f"xray не запустился с новым конфигом ({e}); {back}") from None
         log.info("synced %s", s["name"])
+        return True
+
+
+def explain(e, s):
+    """Понятная причина сбоя для админа."""
+    host, port = s.get("ssh_host"), s.get("ssh_port", 22)
+    if isinstance(e, asyncssh.PermissionDenied):
+        return (
+            "сервер не принял SSH-ключ (Permission denied). Добавьте публичный ключ в "
+            f"~/.ssh/authorized_keys пользователя {s.get('ssh_user', 'root')}"
+        )
+    if isinstance(e, asyncssh.DisconnectError):
+        return f"сервер разорвал SSH-соединение: {e.reason}"
+    if isinstance(e, ConnectionRefusedError):
+        return f"соединение отклонено: на {host}:{port} никто не слушает SSH"
+    if isinstance(e, socket.gaierror):
+        return f"не удаётся найти адрес {host}"
+    if isinstance(e, (asyncio.TimeoutError, TimeoutError)):
+        return f"нет ответа от {host}:{port} (таймаут). Порт закрыт файрволом или сервер недоступен"
+    if isinstance(e, OSError) and not isinstance(e, FileNotFoundError):
+        return f"сетевая ошибка при подключении к {host}:{port}: {e}"
+    return str(e) or type(e).__name__
+
+
+async def _sync_one(i, s):
+    return await asyncio.wait_for(sync_server(i, s), SYNC_TIMEOUT)
 
 
 async def sync_all():
-    """Возвращает список имён серверов, где синхронизация не удалась."""
+    """Возвращает список имён серверов, где синхронизация не удалась (причины в LAST_ERRORS)."""
     async with sync_lock():
         results = await asyncio.gather(
-            *(sync_server(i, s) for i, s in enumerate(SERVERS)), return_exceptions=True
+            *(_sync_one(i, s) for i, s in enumerate(SERVERS)), return_exceptions=True
         )
     failed = []
     for s, r in zip(SERVERS, results):
         if isinstance(r, Exception):
-            log.error("sync failed for %s: %r", s["name"], r)
+            LAST_ERRORS[s["name"]] = explain(r, s)
+            log.error("sync failed for %s: %s", s["name"], LAST_ERRORS[s["name"]])
             failed.append(s["name"])
+        else:
+            LAST_ERRORS.pop(s["name"], None)
     return failed
+
+
+def failed_text(failed):
+    rows = "\n".join(
+        f"• {html.escape(n)}: {html.escape(LAST_ERRORS.get(n, 'неизвестная ошибка'))}" for n in failed
+    )
+    return f"⚠️ Не синхронизированы серверы:\n{rows}\n\nПодробная проверка: /diag"
+
+
+# ---------- диагностика (только чтение, ничего на серверах не меняет) ----------
+async def discover_hints(conn):
+    """Если конфиг не нашли: что вообще запущено на сервере."""
+    out = []
+    r = await conn.run("ps -eo args | grep -i '[x]ray' | head -3", check=False)
+    procs = [l.strip()[:110] for l in (r.stdout or "").splitlines() if l.strip()]
+    out.append("   · процессы xray: " + (html.escape(" | ".join(procs)) if procs else "не найдены"))
+    r = await conn.run("docker ps --format '{{.Names}} ({{.Image}})' 2>/dev/null | head -5", check=False)
+    if (r.stdout or "").strip():
+        out.append("   · docker: " + html.escape(" | ".join(r.stdout.split("\n")[:5])))
+    r = await conn.run(
+        "ls -d /usr/local/x-ui /etc/x-ui /opt/marzban /var/lib/marzban /opt/remnanode 2>/dev/null", check=False
+    )
+    if (r.stdout or "").strip():
+        out.append("   · панель/каталоги: " + html.escape(" ".join(r.stdout.split())))
+        out.append("   ⚠️ если Xray управляется панелью или docker, бот должен менять её конфиг, а не файл на диске")
+    return out
+
+
+async def diag_server(i, s):
+    """(строки отчёта, всё ли в порядке) по одному серверу."""
+    q = shlex.quote
+    xray = s.get("xray_bin", "xray")
+    lines = [f"<b>{html.escape(s['name'])}</b> · {html.escape(str(s['ssh_host']))}:{s.get('ssh_port', 22)}"]
+    state = {"ok": True}
+
+    def good(t):
+        lines.append("✅ " + t)
+
+    def bad(t):
+        state["ok"] = False
+        lines.append("❌ " + t)
+
+    try:
+        async with ssh_connect(s) as conn:
+            who = ((await conn.run("id -un", check=False)).stdout or "").strip() or "?"
+            good(f"SSH: вход выполнен (пользователь {html.escape(who)})")
+            try:
+                path, text = await find_config(conn, s)
+                cfg = parse_config(text)
+            except Exception as e:  # noqa: BLE001
+                bad("конфиг: " + html.escape(explain(e, s)))
+                lines += await discover_hints(conn)
+                return lines, False
+            good(f"конфиг: <code>{html.escape(path)}</code>")
+            vless = vless_inbounds(cfg)
+            for x in vless:
+                cl = (x.get("settings") or {}).get("clients") or []
+                ours = sum(1 for c in cl if str(c.get("email", "")).startswith("tg_"))
+                sec = (x.get("streamSettings") or {}).get("security", "none")
+                lines.append(
+                    f"   · vless порт {x.get('port')}, tag {html.escape(str(x.get('tag')))}, {html.escape(str(sec))}, "
+                    f"клиентов {len(cl)} (от бота {ours})"
+                )
+            try:
+                ib = pick_inbound(cfg, s)
+                good(f"inbound для клиентов: порт {ib.get('port')} (в ссылке {link_port(s)})")
+            except Exception as e:  # noqa: BLE001
+                bad(html.escape(str(e)))
+            r = await conn.run(f"{xray} version", check=False)
+            xray_ok = r.exit_status == 0
+            if xray_ok:
+                good("xray: " + html.escape(((r.stdout or "").strip().splitlines() or ["?"])[0][:60]))
+            else:
+                bad(f"команда «{html.escape(xray)}» не запускается. Укажите полный путь в xray_bin (servers.json)")
+            r = await conn.run(f"test -w {q(path)} && test -w /tmp", check=False)
+            if r.exit_status == 0:
+                good("права на запись есть")
+            else:
+                bad(f"нет прав на запись в {html.escape(path)} или /tmp (пользователь {html.escape(who)})")
+            if xray_ok:
+                tmp = f"/tmp/vpnbot-diag-{i}.json"
+                try:
+                    await sh(conn, f"cat > {tmp}", input=json.dumps(cfg, indent=2, ensure_ascii=False))
+                    await sh(conn, f"{xray} run -test -config {tmp}")
+                    good("пробная проверка конфига (xray -test) проходит")
+                except Exception as e:  # noqa: BLE001
+                    bad("xray -test: " + html.escape(str(e)))
+                finally:
+                    await conn.run(f"rm -f {tmp}", check=False)
+            if s.get("restart_cmd"):
+                lines.append(f"   · перезапуск: <code>{html.escape(s['restart_cmd'])}</code> (не проверяется)")
+            else:
+                r = await conn.run("systemctl is-active xray", check=False)
+                if r.exit_status == 0:
+                    good("служба xray активна")
+                else:
+                    st = (r.stdout or "").strip() or "не найдена"
+                    bad(
+                        f"служба xray: {html.escape(st)}. Если xray запущен иначе (docker, x-ui), "
+                        "задайте restart_cmd в servers.json"
+                    )
+            if state["ok"]:
+                lines.append("➡️ готов к синхронизации")
+    except Exception as e:  # noqa: BLE001
+        bad("SSH: " + html.escape(explain(e, s)))
+    return lines, state["ok"]
+
+
+async def diag_all():
+    """Список сообщений (по ≤3500 символов) с отчётом по всем серверам."""
+    res = await asyncio.gather(
+        *(asyncio.wait_for(diag_server(i, s), 45) for i, s in enumerate(SERVERS)), return_exceptions=True
+    )
+    blocks, ready = [], 0
+    for s, r in zip(SERVERS, res):
+        if isinstance(r, Exception):
+            blocks.append(f"<b>{html.escape(s['name'])}</b>\n❌ {html.escape(explain(r, s))}")
+        else:
+            lines, ok = r
+            ready += 1 if ok else 0
+            blocks.append("\n".join(lines))
+    cur = f"🩺 <b>Диагностика серверов</b>: готово {ready} из {len(SERVERS)}"
+    chunks = []
+    for b in blocks:
+        if len(cur) + len(b) + 2 > 3500:
+            chunks.append(cur)
+            cur = b
+        else:
+            cur += "\n\n" + b
+    chunks.append(cur)
+    return chunks
 
 
 # ---------- подписка (то, что открывает Happ/v2rayN) ----------
@@ -493,6 +843,7 @@ async def admin_ok(c: CallbackQuery):
     if key in _done:
         return await c.answer("Уже обработано")
     _done.add(key)
+    await safe_answer(c, "Выдаю доступ…")  # синхронизация серверов может занять время
     try:
         _, tg_id, plan = c.data.split(":")
         failed, u, notified = await grant(c.bot, int(tg_id), int(plan), record=True)
@@ -505,7 +856,8 @@ async def admin_ok(c: CallbackQuery):
     if not notified:
         note += "\n⚠️ Клиент не получил сообщение"
     await safe_edit(c, f"{c.message.html_text}\n\n✅ Подтверждено{note}")
-    await c.answer()
+    if failed:
+        await c.bot.send_message(ADMIN_ID, failed_text(failed))
 
 
 @admin.callback_query(F.data.startswith("no:"))
@@ -529,6 +881,7 @@ def admin_menu_kb():
                 Btn(text="👥 Клиенты", callback_data="adm:l:0"),
             ],
             [Btn(text="🔄 Синхронизировать серверы", callback_data="adm:sync")],
+            [Btn(text="🩺 Диагностика серверов", callback_data="adm:diag")],
         ]
     )
 
@@ -662,25 +1015,45 @@ async def adm(c: CallbackQuery):
             failed, _, notified = await grant(c.bot, tg_id, plan, record=True)
             toast = toast_for(failed, notified)
             await safe_edit(c, *user_card(tg_id))
+            if failed:
+                await c.bot.send_message(ADMIN_ID, failed_text(failed))
         elif act == "d":
             u = ensure_user(tg_id)
             plan = u["plan"] if u["plan"] in PLANS else min(PLANS)
             failed, _, notified = await grant(c.bot, tg_id, plan, days=int(p[3]))
             toast = toast_for(failed, notified)
             await safe_edit(c, *user_card(tg_id))
+            if failed:
+                await c.bot.send_message(ADMIN_ID, failed_text(failed))
         elif act == "xy":
-            toast = toast_for(await revoke_user(c.bot, tg_id))
+            failed = await revoke_user(c.bot, tg_id)
+            toast = toast_for(failed)
             await safe_edit(c, *user_card(tg_id))
+            if failed:
+                await c.bot.send_message(ADMIN_ID, failed_text(failed))
         elif act == "r":
             failed, notified = await reset_keys(c.bot, tg_id)
             toast = toast_for(failed, notified)
             await safe_edit(c, *user_card(tg_id))
+            if failed:
+                await c.bot.send_message(ADMIN_ID, failed_text(failed))
     elif act == "sync":
         if debounce("sync", 5):
             return await c.answer("Уже выполняется")
+        await safe_answer(c, "Синхронизирую серверы…")
         failed = await sync_all()
-        toast = toast_for(failed) or f"✅ Все серверы ({len(SERVERS)}) синхронизированы"
-    await c.answer(toast, show_alert=bool(toast and toast.startswith("⚠️")))
+        await c.bot.send_message(
+            ADMIN_ID, failed_text(failed) if failed else f"✅ Все серверы ({len(SERVERS)}) синхронизированы"
+        )
+        return
+    elif act == "diag":
+        if debounce("diag", 5):
+            return await c.answer("Уже выполняется")
+        await safe_answer(c, "Проверяю серверы…")
+        for chunk in await diag_all():
+            await c.bot.send_message(ADMIN_ID, chunk)
+        return
+    await safe_answer(c, toast, show_alert=bool(toast and toast.startswith("⚠️")))
 
 
 @admin.message(Command("user"))
@@ -708,7 +1081,7 @@ async def cmd_grant(m: Message, command: CommandObject):
     if not notified:
         text += "\n⚠️ Клиент не получил сообщение (не запускал бота?). Перешлите ссылку сами."
     if failed:
-        text += f"\n⚠️ Не синхронизировались: {', '.join(failed)}"
+        text += "\n\n" + failed_text(failed)
     await m.answer(text)
 
 
@@ -720,7 +1093,15 @@ async def cmd_revoke(m: Message, command: CommandObject):
     except Exception:
         return await m.answer("Формат: /revoke <tg_id>")
     failed = await revoke_user(m.bot, tg_id)
-    await m.answer("Отключён." + (f"\n⚠️ Не синхронизировались: {', '.join(failed)}" if failed else ""))
+    await m.answer("Отключён." + ("\n\n" + failed_text(failed) if failed else ""))
+
+
+@admin.message(Command("diag"))
+async def cmd_diag(m: Message):
+    """/diag — пошаговая проверка всех серверов (SSH, конфиг, xray, права), ничего не меняет"""
+    await m.answer("🩺 Проверяю серверы, это займёт до минуты…")
+    for chunk in await diag_all():
+        await m.answer(chunk)
 
 
 @admin.message(Command("broadcast"))
@@ -765,7 +1146,7 @@ async def watcher(bot: Bot):
             # синхронизация каждый час: сама чинит серверы, которые были недоступны
             failed = set(await sync_all())
             if failed and failed != last_failed:
-                await notify(bot, ADMIN_ID, "⚠️ Не синхронизированы серверы: " + ", ".join(sorted(failed)))
+                await notify(bot, ADMIN_ID, failed_text(sorted(failed)))
             last_failed = failed
 
             for u in expired:
