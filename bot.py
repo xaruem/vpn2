@@ -36,6 +36,7 @@ PORT = int(os.getenv("PORT", "8080"))
 DAYS = 30
 PAGE = 8  # клиентов на странице в админке
 PAID_COOLDOWN = 60  # секунд между заявками «Я оплатил» от одного клиента
+SYNC_EVERY = 600  # максимум секунд между проверками сроков/синхронизациями (раньше было 3600)
 
 # цена -> сколько первых серверов из servers.json получает клиент
 PLANS = {100: 3, 200: 6}
@@ -76,6 +77,24 @@ def load_servers():
 
 SERVERS = load_servers()
 _key_cache = {}
+
+WL_LABEL = "⚪ белые списки"
+
+
+def is_wl(s):
+    """Сервер помечен в servers.json как «белые списки» ("whitelist": true)."""
+    return bool(s.get("whitelist"))
+
+
+def server_title(s):
+    """Имя, которое видит клиент в Happ: у серверов белых списков есть пометка."""
+    return f"{s['name']} · {WL_LABEL}" if is_wl(s) else s["name"]
+
+
+def plan_servers(plan):
+    """Серверы тарифа: первые N из servers.json; обычные сверху, «белые списки» ниже."""
+    chosen = SERVERS[: PLANS.get(plan, 0)]
+    return sorted(chosen, key=is_wl)  # sorted стабилен: порядок внутри групп сохраняется
 
 
 def ssh_key_path(s):
@@ -492,10 +511,18 @@ async def sync_all():
 
 
 def failed_text(failed):
+    # одинаковые причины склеиваем: при битом SSH-ключе иначе приходит 9 одинаковых строк
+    groups = {}
+    for n in failed:
+        groups.setdefault(LAST_ERRORS.get(n, "неизвестная ошибка"), []).append(n)
     rows = "\n".join(
-        f"• {html.escape(n)}: {html.escape(LAST_ERRORS.get(n, 'неизвестная ошибка'))}" for n in failed
+        f"• {html.escape(', '.join(names))}: {html.escape(reason)}" for reason, names in groups.items()
     )
-    return f"⚠️ Не синхронизированы серверы:\n{rows}\n\nПодробная проверка: /diag"
+    return (
+        f"⚠️ Не синхронизированы серверы ({len(failed)} из {len(SERVERS)}):\n{rows}\n\n"
+        "Пока сервер не синхронизирован, истёкшие клиенты на нём ещё могут подключаться.\n"
+        "Подробная проверка: /diag"
+    )
 
 
 # ---------- диагностика (только чтение, ничего на серверах не меняет) ----------
@@ -521,7 +548,8 @@ async def diag_server(i, s):
     """(строки отчёта, всё ли в порядке) по одному серверу."""
     q = shlex.quote
     xray = s.get("xray_bin", "xray")
-    lines = [f"<b>{html.escape(s['name'])}</b> · {html.escape(str(s['ssh_host']))}:{s.get('ssh_port', 22)}"]
+    wl = f" · {WL_LABEL}" if is_wl(s) else ""
+    lines = [f"<b>{html.escape(s['name'])}</b>{wl} · {html.escape(str(s['ssh_host']))}:{s.get('ssh_port', 22)}"]
     state = {"ok": True}
 
     def good(t):
@@ -552,6 +580,10 @@ async def diag_server(i, s):
                     f"   · vless порт {x.get('port')}, tag {html.escape(str(x.get('tag')))}, {html.escape(str(sec))}, "
                     f"клиентов {len(cl)} (от бота {ours})"
                 )
+                if len(cl) - ours > 0:
+                    lines.append(
+                        f"   ⚠️ {len(cl) - ours} клиент(ов) добавлены вручную: бот их не отключает по сроку"
+                    )
             try:
                 ib = pick_inbound(cfg, s)
                 good(f"inbound для клиентов: порт {ib.get('port')} (в ссылке {link_port(s)})")
@@ -629,9 +661,9 @@ async def sub_handler(request):
         raise web.HTTPNotFound()
     links = []
     if is_active(u):
-        for s in SERVERS[: PLANS[u["plan"]]]:
+        for s in plan_servers(u["plan"]):
             links.append(
-                s["link"].replace("{uuid}", u["uuid"]) + "#" + urllib.parse.quote(s["name"])
+                s["link"].replace("{uuid}", u["uuid"]) + "#" + urllib.parse.quote(server_title(s))
             )
     body = base64.b64encode("\n".join(links).encode()).decode()
     title = base64.b64encode("Мой VPN".encode()).decode()
@@ -910,6 +942,12 @@ def stats_text():
         f"Истекают за 3 дня: {soon}\n\n"
         f"Выручка за 30 дней: {rev30} ₽\n"
         f"Выручка всего: {rev_all} ₽"
+        + (
+            f"\n\n⚠️ Серверы без синхронизации: {len(LAST_ERRORS)} из {len(SERVERS)} "
+            "(истёкшие клиенты на них ещё могут подключаться). Подробности: /diag"
+            if LAST_ERRORS
+            else ""
+        )
     )
 
 
@@ -1120,6 +1158,16 @@ async def cmd_broadcast(m: Message, command: CommandObject):
 
 
 # ---------- фоновая проверка сроков ----------
+def next_wakeup():
+    """Сколько спать до следующей проверки: не дольше SYNC_EVERY и не дольше, чем до ближайшего окончания срока
+    (чтобы клиент отключался в момент окончания, а не через час)."""
+    now = int(time.time())
+    row = db.execute("SELECT MIN(expire) FROM users WHERE plan>0 AND expire>?", (now,)).fetchone()
+    nxt = row[0] if row and row[0] else None
+    wait = SYNC_EVERY if nxt is None else min(SYNC_EVERY, nxt - now + 2)
+    return max(5, wait)
+
+
 async def watcher(bot: Bot):
     last_failed = None
     while True:
@@ -1153,7 +1201,7 @@ async def watcher(bot: Bot):
                 await notify(bot, u["tg_id"], "Подписка закончилась. Чтобы продолжить, оплатите: /start")
         except Exception:
             log.exception("watcher error")
-        await asyncio.sleep(3600)
+        await asyncio.sleep(next_wakeup())
 
 
 async def main():

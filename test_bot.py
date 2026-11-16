@@ -81,6 +81,8 @@ class FakeConn:
                     f[p[2]] = f.pop(p[1])
                 elif p[0] == "rm":
                     f.pop(p[1])
+                elif p[0] == "sleep":
+                    pass
                 elif p[0] == "systemctl":
                     if st.get("fail_restart_once"):
                         st["fail_restart_once"] = False
@@ -471,7 +473,7 @@ async def t_watcher_alert():
     orig = asyncio.sleep
 
     async def fast(d, *a, **k):
-        await orig(0 if d >= 3600 else d)
+        await orig(0 if d >= 5 else d)
 
     asyncio.sleep = fast
     try:
@@ -596,13 +598,13 @@ async def t_sync_btn():
     FakeConn.down = {"10.0.0.3"}
     c = FakeCb("adm:sync", ADMIN, fb)
     await bot.adm(c)
-    text, alert = c.answers[0]
-    assert text.startswith("⚠️") and "Сервер 3" in text and alert is True, c.answers
+    msgs = fb.to(ADMIN)
+    assert msgs and msgs[-1].startswith("⚠️") and "Сервер 3" in msgs[-1], msgs
     FakeConn.down = set()
     bot._recent.clear()
     c2 = FakeCb("adm:sync", ADMIN, fb)
     await bot.adm(c2)
-    assert c2.answers[0][0].startswith("✅") and c2.answers[0][1] is False
+    assert fb.to(ADMIN)[-1].startswith("✅"), fb.to(ADMIN)
 
 
 @check("/user: поиск по ID и по @username (без учёта регистра), неизвестный → подсказка")
@@ -763,7 +765,9 @@ async def t_servers_env():
         assert len(bot.load_servers()) == 8
         os.environ.pop("SERVERS_JSON")
         old = bot.SERVERS_FILE
+        old_ls = bot.os.listdir
         bot.SERVERS_FILE = "/nonexistent/servers.json"
+        bot.os.listdir = lambda d: []  # рядом с bot.py лежит servers.example.json: прячем его
         try:
             bot.load_servers()
             assert False, "должна быть ошибка"
@@ -771,6 +775,7 @@ async def t_servers_env():
             assert "SERVERS_JSON" in str(e)
         finally:
             bot.SERVERS_FILE = old
+            bot.os.listdir = old_ls
     finally:
         if saved is None:
             os.environ.pop("SERVERS_JSON", None)
@@ -784,7 +789,8 @@ async def t_key_env():
     real = bot.__dict__.get("_orig_ssh_key_path")
     assert real is None  # подмена из шапки теста не должна влиять на следующую проверку
     src = open(os.path.join(BOTDIR, "bot.py"), encoding="utf-8").read()
-    ns = {"os": os, "base64": base64, "_key_cache": {}}
+    stub = types.SimpleNamespace(import_private_key=lambda data: None)
+    ns = {"os": os, "base64": base64, "_key_cache": {}, "asyncssh": stub}
     start = src.index("def ssh_key_path(s):")
     end = src.index("\n\n\ndb = sqlite3.connect(")
     exec(src[start:end], ns)
@@ -807,6 +813,55 @@ async def t_key_env():
         assert fn({"ssh_key": existing}) == existing, "существующий файл должен иметь приоритет"
     finally:
         os.environ.pop("SSH_KEY_B64", None)
+
+
+# =============== БЕЛЫЕ СПИСКИ, ТОЧНОЕ ОТКЛЮЧЕНИЕ, СТАТУС ===============
+@check("белые списки: пометка в подписке и диагностике, внутри тарифа обычные сверху, «белые списки» ниже")
+async def t_whitelist():
+    fb = fresh()
+    saved = [dict(x) for x in bot.SERVERS]
+    try:
+        bot.SERVERS[1]["whitelist"] = True  # сервер 2 — белые списки
+        u = mk_user(9101, 100, 5)
+        await bot.sync_all()
+        assert u["uuid"] in ids_on(1), "сервер белых списков тоже должен получать клиента"
+        async with TestClient(TestServer(bot.make_app())) as cl:
+            r = await cl.get(f"/sub/{u['token']}")
+            links = base64.b64decode(await r.text()).decode().splitlines()
+        names = [urllib.parse.unquote(l.split("#")[1]) for l in links]
+        assert len(names) == 3, names
+        assert names[0] == "🇷🇺 Сервер 1" and names[1] == "🇷🇺 Сервер 3", names
+        assert names[2] == "🇷🇺 Сервер 2 · " + bot.WL_LABEL, names
+        assert bot.WL_LABEL in "\n".join((await bot.diag_server(1, bot.SERVERS[1]))[0])
+    finally:
+        for a, b in zip(bot.SERVERS, saved):
+            a.clear()
+            a.update(b)
+
+
+@check("watcher просыпается к моменту окончания срока (а не через час) и не чаще раза в 5 сек")
+async def t_wakeup():
+    fresh()
+    assert bot.next_wakeup() == bot.SYNC_EVERY
+    mk_user(9201, 100, 120 / DAY)  # срок через 120 сек
+    assert 100 <= bot.next_wakeup() <= 125, bot.next_wakeup()
+    mk_user(9202, 100, 1 / DAY)  # срок через 1 сек
+    assert bot.next_wakeup() == 5
+
+
+@check("статистика и сообщение о сбое предупреждают: пока сервер не синхронизирован, истёкшие ещё подключаются")
+async def t_stats_warn():
+    fb = fresh()
+    mk_user(9301, 100, 5)
+    FakeConn.down = {"10.0.0.2", "10.0.0.3"}
+    failed = await bot.sync_all()
+    assert len(failed) == 2
+    assert "Серверы без синхронизации: 2" in bot.stats_text()
+    t = bot.failed_text(failed)
+    assert "2 из" in t and "ещё могут подключаться" in t
+    FakeConn.down = set()
+    assert await bot.sync_all() == []
+    assert "без синхронизации" not in bot.stats_text()
 
 
 async def main():
